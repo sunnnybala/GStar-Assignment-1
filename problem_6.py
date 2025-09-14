@@ -61,7 +61,7 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the starting position of the attention window (window_start).
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
 
-    window_start = tl.max(0, q_block_idx * BLOCK_M - (WINDOW_SIZE ))
+    window_start = max(0, q_block_idx * BLOCK_M - (WINDOW_SIZE ))
 
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
