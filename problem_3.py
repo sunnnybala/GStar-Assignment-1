@@ -62,14 +62,28 @@ def _flash_attention_forward_kernel(
         v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
 
         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the online softmax update logic.
+        # Implement the online softmax update logic (streaming, numerically stable).
+        # Ensure consistent fp32 dtype for reductions and dot products.
+        # q_block = tl.cast(q_block, tl.float32)
+        # k_block = tl.cast(k_block, tl.float32)
+        # v_block = tl.cast(v_block, tl.float32)
+        # s_ij = tl.cast(s_ij, tl.float32)
+
         # 1. Find the new running maximum (`m_new`).
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
         # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
+        l_i_rescaled = (l_i*(tl.exp2(m_i-m_new)))
+        mult = tl.exp2(m_i - m_new) # shape: (q_len,)
+        acc_rescaled = acc * mult[:, None] 
         # 3. Compute the attention probabilities for the current tile (`p_ij`).
+        P_tilde_ij = tl.exp2(s_ij - m_new[:, None])
         # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
+        l_new = l_i_rescaled + tl.sum(P_tilde_ij, axis=1)
+        acc = acc_rescaled + tl.dot(P_tilde_ij ,tl.cast(v_block, tl.float32))
         # 5. Update the denominator `l_i`.
+        l_i = l_new
         # 6. Update the running maximum `m_i` for the next iteration.
-        pass
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 

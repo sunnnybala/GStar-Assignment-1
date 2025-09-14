@@ -47,7 +47,7 @@ def _flash_attention_forward_swa_kernel(
     q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h + \
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
     q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
-    
+    q_block = tl.cast(q_block, tl.float32)
     qk_scale = softmax_scale * 1.44269504
 
     # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
@@ -57,8 +57,163 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
-    # --- END OF STUDENT IMPLEMENTATION ---
+    window_start = max(0, q_block_idx * BLOCK_M - WINDOW_SIZE)
+    # --- Phase 0: Sink blocks that are before the sliding window ---
+    sink_end = min(SINK_SIZE, window_start)
+    for start_n in range(0, sink_end, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        k_block = tl.cast(k_block, tl.float32)
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # Attend to sink tokens only (indices < SINK_SIZE), while preserving causality j <= i
+        valid = (k_offsets[None, :] < SINK_SIZE)  
+        s_ij = tl.where(valid, s_ij, -float('inf'))
+        # Load V_j
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = tl.cast(v_block, tl.float32)
+
+        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+        # Implement the online softmax update logic (streaming, numerically stable).
+        # Ensure consistent fp32 dtype for reductions and dot products.
+        # q_block = tl.cast(q_block, tl.float32)
+        # k_block = tl.cast(k_block, tl.float32)
+        # v_block = tl.cast(v_block, tl.float32)
+        # s_ij = tl.cast(s_ij, tl.float32)
+
+        # 1. Find the new running maximum (`m_new`).
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        # 2. Rescale accumulators; guard all-masked tiles to avoid NaNs.
+        no_contrib = m_new == -float('inf')
+        alpha = tl.where(no_contrib, 1.0, tl.exp2(m_i - m_new))
+        acc_rescaled = acc * alpha[:, None]
+        l_i_rescaled = l_i * alpha
+        # 3. Compute probabilities safely.
+        s_shifted = s_ij - m_new[:, None]
+        s_shifted = tl.where(no_contrib[:, None], -float('inf'), s_shifted)
+        P_tilde_ij = tl.exp2(s_shifted)
+        # 4. Update accumulators.
+        l_i = l_i_rescaled + tl.sum(P_tilde_ij, axis=1)
+        acc = acc_rescaled + tl.dot(P_tilde_ij, v_block)
+        # 5. Update running maximum for next iteration.
+        m_i = m_new
+    # --- STUDENT IMPLEMENTATION REQUIRED (Part 2: SWA Logic) ---
+    # Now, implement the "sliding window" by changing the loop bounds.
+    # The kernel should only attend to the `WINDOW_SIZE` most recent key/value tokens.
+    # 1. Calculate the starting position of the attention window (window_start).
+    # 2. Modify the range of the Phase 1 loop to start from your window_start.
+
+    
+
+    # --- Phase 1: Off-Diagonal Blocks (within the window) ---
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
+        # Hint: You might need to apply the per-element sliding window mask to s_ij.
+        #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        k_block = tl.cast(k_block, tl.float32)
+        
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        valid = (q_offsets[:, None] - k_offsets[None, :]) < (WINDOW_SIZE)
+        valid = valid | (k_offsets[None, :] < SINK_SIZE)
+        s_ij = tl.where(valid, s_ij, -float('inf'))
+        # Load V_j
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = tl.cast(v_block, tl.float32)
+
+        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+        # Implement the online softmax update logic (streaming, numerically stable).
+        # Ensure consistent fp32 dtype for reductions and dot products.
+        # q_block = tl.cast(q_block, tl.float32)
+        # k_block = tl.cast(k_block, tl.float32)
+        # v_block = tl.cast(v_block, tl.float32)
+        # s_ij = tl.cast(s_ij, tl.float32)
+
+        # 1. Find the new running maximum (`m_new`).
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        # 2. Rescale accumulators; guard all-masked tiles to avoid NaNs.
+        no_contrib = m_new == -float('inf')
+        alpha = tl.where(no_contrib, 1.0, tl.exp2(m_i - m_new))
+        acc_rescaled = acc * alpha[:, None]
+        l_i_rescaled = l_i * alpha
+        # 3. Compute probabilities safely.
+        s_shifted = s_ij - m_new[:, None]
+        s_shifted = tl.where(no_contrib[:, None], -float('inf'), s_shifted)
+        P_tilde_ij = tl.exp2(s_shifted)
+        # 4. Update accumulators.
+        l_i = l_i_rescaled + tl.sum(P_tilde_ij, axis=1)
+        acc = acc_rescaled + tl.dot(P_tilde_ij, v_block)
+        # 5. Update running maximum for next iteration.
+        m_i = m_new
+        # --- END OF STUDENT IMPLEMENTATION ---
+        # --- END OF STUDENT IMPLEMENTATION ---
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        k_block = tl.cast(k_block, tl.float32)
+        
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # Causal + sliding window mask within the diagonal block
+        valid = (k_offsets[None, :] <= q_offsets[:, None]) & \
+                ((q_offsets[:, None] - k_offsets[None, :]) <(WINDOW_SIZE )) & \
+                (k_offsets[None, :] < SEQ_LEN)
+        valid = valid | ((k_offsets[None, :] < SINK_SIZE) & (k_offsets[None, :] <= q_offsets[:, None]) &(k_offsets[None, :] < SEQ_LEN))
+        s_ij = tl.where(valid, s_ij, -float('inf'))
+        # mask = q_offsets[:, None]-k_offsets[None, :] >= WINDOW_SIZE
+        # s_ij = tl.where(mask, s_ij, -float('inf'))
+        # Load V_j
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = tl.cast(v_block, tl.float32)
+
+        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+        # Implement the online softmax update logic (streaming, numerically stable).
+        # Ensure consistent fp32 dtype for reductions and dot products.
+        # q_block = tl.cast(q_block, tl.float32)
+        # k_block = tl.cast(k_block, tl.float32)
+        # v_block = tl.cast(v_block, tl.float32)
+        # s_ij = tl.cast(s_ij, tl.float32)
+
+        # 1. Find the new running maximum (`m_new`).
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        # 2. Rescale accumulators; guard all-masked tiles to avoid NaNs.
+        no_contrib = m_new == -float('inf')
+        alpha = tl.where(no_contrib, 1.0, tl.exp2(m_i - m_new))
+        acc_rescaled = acc * alpha[:, None]
+        l_i_rescaled = l_i * alpha
+        # 3. Compute probabilities safely.
+        s_shifted = s_ij - m_new[:, None]
+        s_shifted = tl.where(no_contrib[:, None], -float('inf'), s_shifted)
+        P_tilde_ij = tl.exp2(s_shifted)
+        # 4. Update accumulators.
+        l_i = l_i_rescaled + tl.sum(P_tilde_ij, axis=1)
+        acc = acc_rescaled + tl.dot(P_tilde_ij, v_block)
+        # 5. Update running maximum for next iteration.
+        m_i = m_new
+        # --- END OF STUDENT IMPLEMENTATION ---
+        # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
     l_i_safe = tl.where(l_i == 0, 1.0, l_i)
